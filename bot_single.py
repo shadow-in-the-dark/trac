@@ -28,6 +28,9 @@ TEST_MODE    = os.getenv("TEST_MODE", "false").lower() == "true"
 
 WEATHER_API_KEY   = os.getenv("WEATHER_API_KEY", "")
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+GOOGLE_MAPS_KEY   = os.getenv("GOOGLE_MAPS_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 WEATHER_UNITS   = "imperial"  # imperial = °F, metric = °C
 
 logging.basicConfig(
@@ -61,6 +64,7 @@ def get_conn():
 # ══════════════════════════════════════════════════════════════
 import asyncio
 import urllib.request
+import urllib.parse
 import json as _json
 
 WEATHER_EMOJI = {
@@ -327,8 +331,27 @@ async def handle_live_location(update: Update, context: ContextTypes.DEFAULT_TYP
         live_locations[user_id]["last_weather"] = new_condition
         text = f"📍 Обновление погоды — проехали {dist:.0f} км\n\n" + format_weather_coords(data)
         if severe:
-            text += "\n\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Рекомендуем остановиться."
+            text += "\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Рекомендуем остановиться."
         await context.bot.send_message(chat_id=chat_id, text=text)
+
+        # Claude даёт совет при опасной погоде или смене условий
+        if ANTHROPIC_API_KEY and (severe or new_condition != prev_condition):
+            city_name = data.get("name", "текущее местоположение")
+            dest = live_locations[user_id].get("destination", "пункт назначения")
+            weather_summary = (
+                f"- Current: {city_name}, {data['weather'][0]['description']}, "
+                f"temp {data['main']['temp']}°, wind {data['wind']['speed']} mph, "
+                f"condition: {new_condition}"
+            )
+            advice = await claude_weather_advice(
+                weather_summary,
+                f"Driver is en route to {dest}, currently near {city_name}"
+            )
+            if advice:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🤖 Совет от Claude:\n\n{advice}"
+                )
 
 
 # Хранилище маршрутов: {user_id: {"destination": str, "waypoints": [str]}}
@@ -1250,6 +1273,459 @@ async def cb_autotrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ══════════════════════════════════════════════════════════════
+# МАРШРУТ А → Б С ПОГОДОЙ ПО ГОРОДАМ
+# ══════════════════════════════════════════════════════════════
+
+def get_route_cities(origin: str, destination: str) -> list[dict] | None:
+    """
+    Получает список городов по маршруту через Google Maps Directions API.
+    Возвращает [{name, lat, lon}, ...] или None при ошибке.
+    """
+    if not GOOGLE_MAPS_KEY:
+        return None
+    try:
+        params = urllib.parse.urlencode({
+            "origin": origin,
+            "destination": destination,
+            "key": GOOGLE_MAPS_KEY,
+        })
+        url = f"https://maps.googleapis.com/maps/api/directions/json?{params}"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = _json.loads(r.read())
+
+        if data["status"] != "OK":
+            log.warning(f"Google Maps: {data['status']}")
+            return None
+
+        # Извлекаем промежуточные точки из шагов маршрута
+        cities = []
+        seen = set()
+
+        def add_city(name, lat, lon):
+            key = name.lower()
+            if key not in seen and name:
+                seen.add(key)
+                cities.append({"name": name, "lat": lat, "lon": lon})
+
+        # Старт
+        leg = data["routes"][0]["legs"][0]
+        add_city(origin, leg["start_location"]["lat"], leg["start_location"]["lng"])
+
+        # Промежуточные города из шагов
+        for step in leg["steps"]:
+            html = step.get("html_instructions", "")
+            # Ищем названия городов в инструкциях
+            import re
+            matches = re.findall(r"([A-Z][a-zA-Z\s]+),\s*([A-Z]{2})", html)
+            for city, state in matches:
+                city = city.strip()
+                if len(city) > 2:
+                    lat = step["end_location"]["lat"]
+                    lon = step["end_location"]["lng"]
+                    add_city(f"{city}, {state}", lat, lon)
+
+        # Финиш
+        add_city(destination, leg["end_location"]["lat"], leg["end_location"]["lng"])
+
+        # Если промежуточных не нашли — добавляем старт и финиш
+        if len(cities) < 2:
+            cities = [
+                {"name": origin, "lat": leg["start_location"]["lat"], "lon": leg["start_location"]["lng"]},
+                {"name": destination, "lat": leg["end_location"]["lat"], "lon": leg["end_location"]["lng"]},
+            ]
+
+        return cities
+
+    except Exception as e:
+        log.warning(f"Google Maps ошибка: {e}")
+        return None
+
+
+def get_weather_3day_by_coords(lat: float, lon: float, city_name: str, label: str) -> str:
+    """Погода + прогноз 3 дня по координатам."""
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+    try:
+        # Текущая погода
+        url_now = (
+            f"https://api.openweathermap.org/data/2.5/weather"
+            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru"
+        )
+        with urllib.request.urlopen(url_now, timeout=5) as r:
+            w = _json.loads(r.read())
+
+        main  = w["main"]
+        wind  = w["wind"]
+        cond  = w["weather"][0]
+        emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+        name  = w.get("name", city_name)
+        warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
+
+        lines = [
+            f"{emoji} {label} — {name}",
+            f"🌡 Сейчас: {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
+            f"💧 Влажность: {main['humidity']}%",
+            f"💨 Ветер: {wind['speed']:.1f} {speed}",
+            f"🌥 {cond['description'].capitalize()}{warn}",
+            "",
+            "📅 Прогноз на 3 дня:",
+        ]
+
+        # Прогноз
+        url_fc = (
+            f"https://api.openweathermap.org/data/2.5/forecast"
+            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24"
+        )
+        with urllib.request.urlopen(url_fc, timeout=5) as r:
+            fc = _json.loads(r.read())
+
+        seen_days = set()
+        for item in fc["list"]:
+            dt  = datetime.fromtimestamp(item["dt"])
+            day = dt.strftime("%a %d.%m")
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            if len(seen_days) > 3:
+                break
+            t_max = item["main"]["temp_max"]
+            t_min = item["main"]["temp_min"]
+            desc  = item["weather"][0]["description"]
+            em    = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
+            lines.append(f"{em} {day}: {t_max:.0f}/{t_min:.0f}{unit} — {desc}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"❌ Погода для {city_name}: {e}"
+
+
+# ── Состояния диалога маршрута ────────────────────────────────
+ROUTE_AB_ORIGIN = 800
+ROUTE_AB_DEST   = 801
+
+
+async def cmd_routeweather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало диалога: запрос точки А."""
+    await update.message.reply_text(
+        "🗺 Введите точку отправления (город):\n\n"
+        "Например: <code>San Bernardino, CA</code>",
+        parse_mode="HTML"
+    )
+    return ROUTE_AB_ORIGIN
+
+
+async def st_route_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает точку А, запрашивает точку Б."""
+    context.user_data["route_origin"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Точка А: {context.user_data['route_origin']}\n\n"
+        "Теперь введите точку назначения:\n"
+        "Например: <code>Teterboro, NJ</code>",
+        parse_mode="HTML"
+    )
+    return ROUTE_AB_DEST
+
+
+async def st_route_dest_ab(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает точку Б, строит маршрут и отправляет погоду."""
+    origin = context.user_data.pop("route_origin", "")
+    dest   = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    msg = await update.message.reply_text(
+        f"🔍 Строю маршрут {origin} → {dest}...\n"
+        f"Получаю погоду по всем городам..."
+    )
+
+    if not GOOGLE_MAPS_KEY:
+        # Без Google Maps — только старт и финиш
+        await msg.edit_text(f"📋 Маршрут: {origin} → {dest}\n\nПолучаю погоду...")
+        # Геокодируем вручную через OpenWeatherMap
+        cities_simple = []
+        for city_name in [origin, dest]:
+            try:
+                url = (f"https://api.openweathermap.org/geo/1.0/direct"
+                       f"?q={urllib.parse.quote(city_name)}&limit=1&appid={WEATHER_API_KEY}")
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    geo = _json.loads(r.read())
+                if geo:
+                    cities_simple.append({"name": city_name, "lat": geo[0]["lat"], "lon": geo[0]["lon"]})
+            except Exception:
+                pass
+        if len(cities_simple) >= 2:
+            await send_route_weather_with_claude(context.bot, chat_id, cities_simple, origin, dest)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось найти города. Проверьте названия.")
+        return ConversationHandler.END
+
+    cities = get_route_cities(origin, dest)
+    if not cities:
+        await msg.edit_text(
+            f"❌ Не удалось построить маршрут {origin} → {dest}\n"
+            "Проверьте правильность названий городов."
+        )
+        return ConversationHandler.END
+
+    await msg.edit_text(
+        f"🗺 Маршрут: {origin} → {dest}\n"
+        f"Найдено точек: {len(cities)}\n"
+        f"Анализирую погоду + советы от Claude..."
+    )
+    await send_route_weather_with_claude(context.bot, chat_id, cities, origin, dest)
+    return ConversationHandler.END
+
+
+async def conv_routeab_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+def build_routeab_conv():
+    return ConversationHandler(
+        entry_points=[CommandHandler("routeweather", cmd_routeweather)],
+        states={
+            ROUTE_AB_ORIGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_route_origin)],
+            ROUTE_AB_DEST:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_route_dest_ab)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_routeab_cancel)],
+        per_user=True, per_chat=False,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# CLAUDE AI — АНАЛИЗ ПОГОДЫ ПО МАРШРУТУ
+# ══════════════════════════════════════════════════════════════
+
+async def claude_analyze_route(weather_summary: str, origin: str, destination: str) -> str:
+    """
+    Отправляет сводку погоды по маршруту в Claude API.
+    Возвращает советы для водителя-дальнобойщика.
+    """
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        prompt = (
+            f"You are a safety advisor for a truck driver traveling from {origin} to {destination}.\n"
+            f"Here is the weather data for cities along the route:\n\n"
+            f"{weather_summary}\n\n"
+            "Analyze this weather data and provide concise safety advice in Russian. Focus on:\n"
+            "1. Most dangerous weather conditions on the route\n"
+            "2. Specific cities where driver should be extra careful\n"
+            "3. Recommended speed adjustments\n"
+            "4. Any suggested stops or route changes\n"
+            "5. Overall safety rating for this route (Safe / Caution / Dangerous)\n\n"
+            "Be concise — max 10 lines. Use emojis. Write in Russian."
+        )
+
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = _json.loads(r.read())
+
+        return data["content"][0]["text"].strip()
+
+    except Exception as e:
+        log.warning(f"Claude API ошибка: {e}")
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════
+# CLAUDE AI — УМНЫЕ СОВЕТЫ ПО ПОГОДЕ
+# ══════════════════════════════════════════════════════════════
+
+async def claude_weather_advice(weather_summary: str, context_info: str = "") -> str:
+    """
+    Отправляет сводку погоды в Claude и получает советы для водителя.
+    weather_summary — текст с погодой по всем городам маршрута.
+    context_info — доп. контекст (текущее местоположение, маршрут).
+    """
+    if not ANTHROPIC_API_KEY:
+        return ""
+
+    prompt = (
+        "You are a safety advisor for a truck driver. "
+        "Analyze the weather conditions along the route and provide practical advice. "
+        "Be concise — max 5 bullet points. Write in Russian. "
+        "Focus on: dangerous conditions, recommended actions, speed adjustments, rest stops. "
+        "If weather is fine — say so briefly.\n\n"
+        f"Route/location info: {context_info}\n\n"
+        f"Weather data:\n{weather_summary}"
+    )
+
+    try:
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = _json.loads(r.read())
+        return data["content"][0]["text"].strip()
+    except Exception as e:
+        log.warning(f"Claude API: {e}")
+        return ""
+
+
+def collect_weather_summary(cities_weather: list[dict]) -> str:
+    """Собирает текстовую сводку погоды для Claude."""
+    lines = []
+    for item in cities_weather:
+        lines.append(
+            f"- {item['label']} {item['city']}: "
+            f"{item['temp']}°, {item['description']}, "
+            f"wind {item['wind']} mph, "
+            f"condition: {item['main_condition']}"
+        )
+    return "\n".join(lines)
+
+
+async def get_weather_data_for_city(lat: float, lon: float, city_name: str) -> dict:
+    """Возвращает словарь с данными погоды для города."""
+    try:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/weather"
+            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=en"
+        )
+        with urllib.request.urlopen(url, timeout=5) as r:
+            w = _json.loads(r.read())
+        return {
+            "city": w.get("name", city_name),
+            "temp": round(w["main"]["temp"]),
+            "feels_like": round(w["main"]["feels_like"]),
+            "humidity": w["main"]["humidity"],
+            "wind": round(w["wind"]["speed"], 1),
+            "description": w["weather"][0]["description"],
+            "main_condition": w["weather"][0]["main"],
+            "lat": lat,
+            "lon": lon,
+        }
+    except Exception as e:
+        log.warning(f"Weather data for {city_name}: {e}")
+        return {
+            "city": city_name, "temp": "?", "feels_like": "?",
+            "humidity": "?", "wind": "?",
+            "description": "unavailable", "main_condition": "Unknown",
+            "lat": lat, "lon": lon,
+        }
+
+
+async def send_route_weather_with_claude(
+    bot, chat_id: int,
+    cities: list[dict],
+    origin: str, dest: str,
+    trigger: str = "route"
+):
+    """
+    Главная функция: отправляет погоду по маршруту + совет от Claude.
+    cities = [{"name", "lat", "lon"}, ...]
+    trigger = "route" | "location"
+    """
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed_unit = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+
+    cities_weather = []
+    weather_msgs   = []
+
+    for i, city in enumerate(cities):
+        if i == 0:
+            label = "🚦 Старт"
+        elif i == len(cities) - 1:
+            label = "🏁 Финиш"
+        else:
+            label = f"📍 {i}/{len(cities)-2}"
+
+        w = await get_weather_data_for_city(city["lat"], city["lon"], city["name"])
+        w["label"] = label
+        cities_weather.append(w)
+
+        # Прогноз на 3 дня
+        fc_lines = []
+        try:
+            url_fc = (
+                f"https://api.openweathermap.org/data/2.5/forecast"
+                f"?lat={city['lat']}&lon={city['lon']}"
+                f"&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24"
+            )
+            with urllib.request.urlopen(url_fc, timeout=5) as r:
+                fc = _json.loads(r.read())
+            seen = set()
+            for item in fc["list"]:
+                dt  = datetime.fromtimestamp(item["dt"])
+                day = dt.strftime("%a %d.%m")
+                if day in seen: continue
+                seen.add(day)
+                if len(seen) > 3: break
+                em = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
+                fc_lines.append(
+                    f"{em} {day}: {item['main']['temp_max']:.0f}/{item['main']['temp_min']:.0f}{unit}"
+                    f" — {item['weather'][0]['description']}"
+                )
+        except Exception:
+            pass
+
+        em    = WEATHER_EMOJI.get(w["main_condition"], "🌡️")
+        warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if w["main_condition"] in SEVERE_CONDITIONS else ""
+        msg   = (
+            f"{em} {label} — {w['city']}\n"
+            f"🌡 {w['temp']}{unit}, ощущается {w['feels_like']}{unit}\n"
+            f"💧 Влажность: {w['humidity']}%\n"
+            f"💨 Ветер: {w['wind']} {speed_unit}\n"
+            f"🌥 {w['description'].capitalize()}{warn}"
+        )
+        if fc_lines:
+            msg += "\n\n📅 Прогноз на 3 дня:\n" + "\n".join(fc_lines)
+
+        weather_msgs.append(msg)
+
+    # Отправляем погоду по каждому городу
+    for msg in weather_msgs:
+        await bot.send_message(chat_id=chat_id, text=msg)
+
+    # Claude анализирует всю сводку и даёт совет
+    if ANTHROPIC_API_KEY:
+        summary = collect_weather_summary(cities_weather)
+        context_info = f"Route: {origin} → {dest}" if trigger == "route" else f"Current location near {cities[0]['name']}, heading to {dest}"
+        advice = await claude_weather_advice(summary, context_info)
+        if advice:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🤖 Совет от Claude:\n\n{advice}"
+            )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="✅ Анализ маршрута завершён. Для отслеживания в пути: /liveweather"
+    )
+
+
 def main():
     init_db()
     log.info("БД инициализирована.")
@@ -1262,6 +1738,7 @@ def main():
     app.add_handler(CommandHandler("parsetrip", cmd_parsetrip))
 
     # ── Сначала ConversationHandler-ы ────────────────────────
+    app.add_handler(build_routeab_conv())
     app.add_handler(build_route_conv())
     app.add_handler(build_conv())
 
